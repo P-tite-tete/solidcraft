@@ -490,11 +490,28 @@ fn batch_stops_at_first_error_and_rolls_back() {
     let r = raw_tool(
         &mut s,
         "batch",
-        json!({"rollback": false, "commands": [{"command": "solid.sphere", "params": {"radius": 3, "center": [50, 0, 0]}}, {"command": "NoSuchCommand"}]}),
+        json!({"rollback": false, "commands": [{"command": "solid.sphere", "params": {"radius": 3, "center": [50, 0, 0]}}, {"command": "solid.extrude", "params": {"distance": "bogus +"}}]}),
     );
     assert_eq!(r["result"]["isError"], true);
-    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("NoSuchCommand"));
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("solid.extrude"));
     assert_eq!(tool(&mut s, "measure", json!({}))["body_count"], 2);
+}
+
+/// #5853: a misspelled command, however late in the batch, refuses the batch before its first
+/// step: nothing runs, nothing is undone, and the error names the closest command.
+#[test]
+fn batch_refuses_an_unknown_command_before_the_first_step() {
+    let mut s = server();
+    let mut steps: Vec<Value> = (0..20).map(|k| json!({"command": "solid.sphere", "params": {"radius": 1, "center": [k * 5, 0, 0]}})).collect();
+    steps.push(json!({"command": "solid.extrud", "params": {"distance": 5}}));
+    let r = raw_tool(&mut s, "batch", json!({"commands": steps}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!((body["completed"].clone(), body["failed"]["index"].clone(), body["undone"].clone()), (json!(0), json!(20), json!(0)), "{body}");
+    assert!(body["failed"]["error"].as_str().is_some_and(|e| e.contains("closest: `solid.extrude`")), "{body}");
+    assert_eq!((body["applied"].clone(), body["not_run"].as_array().map(Vec::len)), (json!([]), Some(21)), "{body}");
+    assert_eq!(tool(&mut s, "measure", json!({}))["body_count"], 0, "no step ran");
+    assert_eq!(tool(&mut s, "inspect_design", json!({"measure": false}))["undo"], 0);
 }
 
 /// #5822: with `coalesce_parameters` a batch of parameter edits, one per step, rebuilds the
@@ -607,7 +624,8 @@ fn a_failed_batch_with_file_new_restores_the_original_design() {
         json!({"rollback": true, "commands": [
             {"command": "file.new", "params": {"name": "Replacement"}},
             {"command": "solid.box", "params": {"length": 2, "width": 2, "height": 2}},
-            {"command": "not.a.command"},
+            // Fails at its turn (an unknown command would be refused before the first step, #5853).
+            {"command": "solid.extrude", "params": {"distance": "bogus +"}},
         ]}),
     );
     assert_eq!(r["result"]["isError"], true, "{r}");
@@ -808,6 +826,28 @@ fn legacy_design_files_and_resource_uris() {
     let _ = std::fs::remove_file(&path);
     let d = call(&mut s, 1, "resources/read", json!({"uri": "solvecraft://design"}));
     assert!(d["result"]["contents"][0]["text"].as_str().unwrap().contains("timeline"));
+
+    // `.sc` is what new designs are saved as; a `.solidcraft` file opens and `save {}` writes it
+    // back under its own name.
+    let dir = std::env::temp_dir().join(format!("solidcraft-mcp-ext-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (new, old) = (dir.join("part.sc"), dir.join("part.solidcraft"));
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10}}));
+    tool(&mut s, "save", json!({"path": new.to_string_lossy()}));
+    assert!(new.is_file());
+    std::fs::rename(&new, &old).unwrap();
+    tool(&mut s, "open", json!({"path": old.to_string_lossy()}));
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 5, "width": 5, "height": 5}}));
+    tool(&mut s, "save", json!({}));
+    assert!(old.is_file() && !new.exists(), "save keeps the opened file's name");
+    assert_eq!(solidcraft_engine::io::read_design(&std::fs::read(&old).unwrap()).unwrap().features.len(), 2);
+    tool(&mut s, "open", json!({"path": old.to_string_lossy()}));
+    tool(&mut s, "save", json!({"path": new.to_string_lossy()}));
+    tool(&mut s, "open", json!({"path": new.to_string_lossy()}));
+    assert!(old.is_file() && new.is_file(), "save as leaves the old file");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The default folders (#205): the recovery folder works out of the box, `screenshot` without a
@@ -1826,7 +1866,7 @@ fn batch_reports_timings_and_profile() {
     let r = raw_tool(
         &mut s,
         "batch",
-        json!({"timings": true, "commands": [{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}, {"command": "NoSuchCommand"}]}),
+        json!({"timings": true, "commands": [{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}, {"command": "solid.extrude", "params": {"distance": "bogus +"}}]}),
     );
     let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(body["timings"].as_array().map(Vec::len), Some(2), "the failing step is timed too: {body}");
