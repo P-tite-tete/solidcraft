@@ -31,6 +31,20 @@ thread_local! {
     /// The 3D view's own dark or light when Preferences give it one ([`ViewportTheme`], #4146),
     /// per thread like the rest. `None`: the view is as dark as the window.
     static VIEWPORT_DARK: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Counts the changes to the theme state above: every setter adds one.
+    static GENERATION: Cell<u64> = const { Cell::new(0) };
+    /// The last [`Tokens::get_in`]: the generation and mode it was made for, and its tokens.
+    /// Building the palette took a large share of a frame, as the UI asks for it at every widget.
+    static MADE: Cell<Option<(u64, ColorVision, Tokens)>> = const { Cell::new(None) };
+}
+
+/// When `changed`, the theme state is different: tokens made before are stale. The app sets the
+/// state from its preferences every frame, so setting a value it already has keeps them.
+fn changed_if(changed: bool) -> bool {
+    if changed {
+        GENERATION.set(GENERATION.get().wrapping_add(1));
+    }
+    changed
 }
 
 /// Three structural border levels plus independent content and control outlines.
@@ -230,13 +244,13 @@ pub struct Custom {
 /// Use a theme file's palette for its base, or the built-in palettes (`None`). Returns whether
 /// that changed anything (the visuals follow on the next [`apply`]).
 pub fn set_custom(custom: Option<Custom>) -> bool {
-    CUSTOM.with(|c| c.replace(custom) != custom)
+    changed_if(CUSTOM.with(|c| c.replace(custom) != custom))
 }
 
 /// Draw the logo in the theme's accent (`true`) or its own logo colours. Returns whether that
 /// changed anything (the visuals follow on the next [`apply`]).
 pub fn set_logo_accent(on: bool) -> bool {
-    LOGO_ACCENT.with(|c| c.replace(on) != on)
+    changed_if(LOGO_ACCENT.with(|c| c.replace(on) != on))
 }
 
 /// Isolated widget tests restore the thread's theme even when an assertion fails.
@@ -490,7 +504,7 @@ pub fn vision() -> ColorVision {
 
 /// Switch the colour vision mode (the visuals follow on the next [`apply`]).
 pub fn set_vision(mode: ColorVision) {
-    VISION.with(|v| v.set(mode));
+    changed_if(VISION.with(|v| v.replace(mode)) != mode);
 }
 
 /// An sRGB colour carried by model data, including file colours and point-cloud shading.
@@ -874,8 +888,17 @@ impl Tokens {
     /// [`Tokens::get`] in another colour vision mode: the Colour vision preference previews the
     /// mode being chosen before it is applied (#7152).
     pub fn get_in(mode: ColorVision) -> Tokens {
+        let generation = GENERATION.get();
+        if let Some((made, made_mode, tokens)) = MADE.get()
+            && made == generation
+            && made_mode == mode
+        {
+            return tokens;
+        }
         let window = Tokens::themed(is_dark(), mode);
-        if viewport_dark() == is_dark() { window } else { window.with_viewport(Tokens::themed(viewport_dark(), mode)) }
+        let tokens = if viewport_dark() == is_dark() { window } else { window.with_viewport(Tokens::themed(viewport_dark(), mode)) };
+        MADE.set(Some((generation, mode, tokens)));
+        tokens
     }
 
     /// The tokens of the 3D view's side (#4146), for a window colour drawn straight onto the view
@@ -958,7 +981,9 @@ impl Tokens {
     }
 
     /// The tokens of a theme and colour vision mode: a theme file's palette when one is on for
-    /// that base ([`set_custom`]), else the built-in one; the colour vision mode on top.
+    /// that base ([`set_custom`]), else the built-in one; the colour vision mode on top. Every
+    /// state read here (or by [`Tokens::get_in`]) is set through a setter that calls `changed_if`,
+    /// or the kept tokens would go stale.
     pub fn themed(dark: bool, mode: ColorVision) -> Tokens {
         let custom = CUSTOM.get().filter(|c| c.dark == dark).map(|c| c.tokens);
         let t = custom.unwrap_or(if dark { Tokens::dark() } else { Tokens::light() });
@@ -1007,12 +1032,12 @@ pub fn material_color(name: &str) -> Option<Color32> {
 
 /// Switch themes (the visuals follow on the next [`apply`]).
 pub fn set_dark(dark: bool) {
-    DARK.set(dark);
+    changed_if(DARK.replace(dark) != dark);
 }
 
 /// Give the 3D view its own dark or light (#4146), or `None` to draw it as dark as the window.
 pub fn set_viewport_dark(dark: Option<bool>) {
-    VIEWPORT_DARK.set(dark);
+    changed_if(VIEWPORT_DARK.replace(dark) != dark);
 }
 
 fn visuals(dark: bool) -> egui::Visuals {
@@ -1344,5 +1369,48 @@ mod tests {
             }
         }
         super::set_viewport_dark(None);
+    }
+
+    /// The tokens are made once and kept until the theme changes: each change of the window's
+    /// or the view's darkness, the colour vision mode, the theme file or the logo is seen at once,
+    /// and another mode asked for (a preview) gets its own tokens.
+    #[test]
+    fn kept_tokens_follow_every_theme_change() {
+        use super::{ColorVision, Custom, Tokens};
+        super::set_dark(true);
+        super::set_viewport_dark(None);
+        super::set_vision(ColorVision::Off);
+        super::set_custom(None);
+        super::set_logo_accent(false);
+        let dark = Tokens::get();
+        assert_eq!(dark, Tokens::themed(true, ColorVision::Off));
+        let made = super::GENERATION.get();
+        super::set_dark(true);
+        super::set_vision(ColorVision::Off);
+        assert_eq!(super::GENERATION.get(), made, "setting what is already set keeps the tokens");
+        assert_eq!(Tokens::get(), dark, "asked again, the same tokens");
+        super::set_dark(false);
+        assert_eq!(Tokens::get(), Tokens::themed(false, ColorVision::Off));
+        assert_ne!(Tokens::get(), dark);
+        super::set_vision(ColorVision::Tritan);
+        assert_eq!(Tokens::get(), Tokens::themed(false, ColorVision::Tritan));
+        assert_eq!(Tokens::get_in(ColorVision::Off), Tokens::themed(false, ColorVision::Off), "a previewed mode");
+        assert_eq!(Tokens::get(), Tokens::themed(false, ColorVision::Tritan), "and back");
+        super::set_viewport_dark(Some(true));
+        assert_eq!(Tokens::get(), Tokens::themed(false, ColorVision::Tritan).with_viewport(Tokens::themed(true, ColorVision::Tritan)));
+        super::set_viewport_dark(None);
+        let plain_logo = Tokens::get().logo;
+        super::set_logo_accent(true);
+        assert_eq!(Tokens::get(), Tokens::themed(false, ColorVision::Tritan));
+        assert_ne!(Tokens::get().logo, plain_logo, "the logo in the accent");
+        super::set_logo_accent(false);
+        let mut file = Tokens::themed(false, ColorVision::Off);
+        file.text = egui::Color32::from_rgb(1, 2, 3);
+        super::set_vision(ColorVision::Off);
+        super::set_custom(Some(Custom { dark: false, tokens: file }));
+        assert_eq!(Tokens::get().text, egui::Color32::from_rgb(1, 2, 3), "a theme file's colours");
+        super::set_custom(None);
+        assert_eq!(Tokens::get(), Tokens::themed(false, ColorVision::Off));
+        super::set_dark(true);
     }
 }
